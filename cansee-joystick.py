@@ -1,5 +1,25 @@
 #!/usr/bin/python3
 
+"""
+    CanSee Joystick
+    Use your Renault Zoe as a joystick
+
+    Copyright (C) 2020 - Léopold Baillard
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or any
+    later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
 import os
 import sys
 import serial
@@ -7,7 +27,6 @@ import time
 import subprocess
 import signal
 import fcntl
-import threading
 import uinput
 
 HCI_DEV = "/dev/rfcomm0"
@@ -35,34 +54,50 @@ FIELDS = {
         "options": 0xff,
         "offset": 0,
         "resolution": 0.125
+    },
+    "break_pressed": {
+        "id": "0x18daf1da",
+        "request": "22200f",
+        "response": "62200f",
+        "options": 0xff,
+        "offset": 0,
+        "resolution": 1
+    },
+    "button_pressed": {
+        "id": "0x18daf1da",
+        "request": "222039",
+        "response": "622039",
+        "options": 0xff,
+        "offset": 0,
+        "resolution": 1
     }
 }
-BT_ADDR = "10:52:1C:5D:76:C2"  # CanSee
-# BT_ADDR = "F0:08:D1:D7:C0:C2"  # Dev
+BT_ADDR = "xx:xx:xx:xx:xx:x"  # CanSee BT address
 BT_DEV = "hci0"
 HCI_OPEN_TIMEOUT = 5
 CAN_GATEWAY_REOPEN_TIMEOUT = 1500
-
-# Output values
-throttle_position = 0
-steering_angle = 0
 
 # Joystick config
 joystick_events = (
     uinput.ABS_WHEEL,
     uinput.ABS_THROTTLE,
-    uinput.ABS_BRAKE
+    uinput.BTN_0,
+    uinput.BTN_1,
+    uinput.BTN_2
 )
 
 
-class DataThread():
-    def __init__(self, name):
-        self.name = name
+class CanSeeJoystick:
+    def __init__(self):
+        self.hci_proc = None
+        self.joystick = None
+        self.throttle_position = 0
+        self.steering_angle = 0
+        self.break_pressed = 0
+        self.button_pressed = 0
+        self.gateway_last_open = 0
 
     def run(self):
-        global throttle_position
-        global steering_angle
-
         # Init bluetooth
         self.hci_proc = self.init_bluetooth()
 
@@ -75,40 +110,42 @@ class DataThread():
         # Start command loop
         self.start_command_loop(ser, self.hci_proc)
 
-    def non_block_read(self, output):
+    @staticmethod
+    def non_block_read(output):
         fd = output.fileno()
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
         try:
             return output.read()
         except:
+            # Fail silently, not mission critical
             return ""
 
-    def field_is_string(self, field):
+    @staticmethod
+    def field_is_string(field):
         return (field["options"] & FIELD_TYPE_MASK) == FIELD_TYPE_STRING
 
-    def field_is_signed(self, field):
+    @staticmethod
+    def field_is_signed(field):
         return (field["options"] & FIELD_TYPE_MASK) == FIELD_TYPE_SIGNED
 
     def parse_message(self, field, data):
         if len(data) > len(field["response"]):
             data = data[len(field["response"]):]
             if self.field_is_signed(field):
-                return (int(data, 16) - field["offset"])
+                return int(data, 16) - field["offset"]
             elif self.field_is_string(field):
                 if data[:2] == "00":
-                    # return (int(data[2:], 16) - field["offset"]) * field["resolution"]
-                    return (int(data[2:], 16) - field["offset"])
+                    return int(data[2:], 16) - field["offset"]
                 elif data[:2] == "ff":
-                    # return (- int(data[2:], 16) - field["offset"]) * field["resolution"]
-                    return (-255 + int(data[2:], 16) - field["offset"])
+                    # FIXME: quick hack to get value bounds
+                    return -255 + int(data[2:], 16) - field["offset"]
             else:
-                # return (int(data, 16) - field["offset"]) * field["resolution"]
-                return (int(data, 16) - field["offset"])
+                return int(data, 16) - field["offset"]
         return None
 
-    def response_to_message(self, field, serial, timeout=1000):
-        response = self.send_and_wait(field, serial, timeout)
+    def response_to_message(self, field, ser, timeout=1000):
+        response = self.send_and_wait(field, ser, timeout)
 
         if len(response) == 0:
             return None
@@ -120,35 +157,28 @@ class DataThread():
 
         # Check for NaN
         try:
-            id = int(pieces[0].strip(), 16)
+            message_id = int(pieces[0].strip(), 16)
         except:
+            # If the int cast errors out, return None to ignore the value
             return None
 
-        # Check ID
-        if id != int(field["id"], 16):
-            # print(id)
+        # Check that ID matches what we want
+        if message_id != int(field["id"], 16):
             return None
 
         # Parse message
         return self.parse_message(field, pieces[1].strip().lower())
 
-    def send_and_wait(self, field, serial, timeout):
-        serial.flushInput()
-        serial.flushOutput()
-        # print("Send: {}".format(self.get_command_from_field(field)))
-        serial.write(bytes(self.get_command_from_field(field) + "\n", 'UTF-8'))
+    def send_and_wait(self, field, ser, timeout):
+        ser.flushInput()
+        ser.flushOutput()
+        ser.write(bytes(self.get_command_from_field(field) + "\n", 'UTF-8'))
         response = ''
-        prev = ''
         start = time.time() * 1000.0
 
         while True:
-            # print("Read")
-            # response += serial.read(1).decode('ascii')
-            # print(response)
-            # if response.endswith('\n'):
-            #     return response
-            if serial.inWaiting() > 0:
-                response += serial.read(serial.inWaiting()).decode('ascii')
+            if ser.inWaiting() > 0:
+                response += ser.read(ser.inWaiting()).decode('ascii')
                 if response.endswith('\n'):
                     return response
             if ((time.time() * 1000.0) - start) > timeout:
@@ -157,7 +187,8 @@ class DataThread():
 
         return response
 
-    def get_command_from_field(self, field):
+    @staticmethod
+    def get_command_from_field(field):
         if "id" not in field or "request" not in field:
             raise ValueError
 
@@ -174,6 +205,7 @@ class DataThread():
             )
 
     def init_bluetooth(self):
+        # FIXME: use a Python BT library instead
         # Init rfcomm if needed
         proc = None
         hci_open_time = time.time()
@@ -215,23 +247,15 @@ class DataThread():
         print("OK")
         return proc
 
-    def init_serial(self):
+    @staticmethod
+    def init_serial():
         # Open serial port
         serial_conn = serial.Serial(HCI_DEV)
-        self.gateway_last_open = 0
         return serial_conn
 
-    def start_command_loop(self, ser, hci_proc):
-        global steering_angle
-        global throttle_position
+    def start_command_loop(self, ser):
         while True:
             try:
-                # if ser.inWaiting() > 0:
-                #     data_str = ser.read(ser.inWaiting()).decode('ascii')
-                #     print("Received: ", end='')
-                #     print(parse_received(data_str, STEERING_WHEEL_ANGLE_CMD), end='')
-                #     # print("Received: {}".format(), end='')
-
                 # Keep the gateway opened
                 ms = time.time() * 1000.0
                 if (ms - self.gateway_last_open) >= CAN_GATEWAY_REOPEN_TIMEOUT:
@@ -240,27 +264,36 @@ class DataThread():
                     ser.write(bytes(self.get_command_from_field(FIELDS["gateway_open"]) + "\n", 'UTF-8'))
 
                 # Send data queries
-                # print("Requesting steering angle")
-                steering_angle = self.response_to_message(FIELDS["steering_angle"], ser)
-                print(steering_angle)
-                # print("Requesting throttle position")
-                throttle_position = self.response_to_message(FIELDS["throttle_position"], ser)
-                print(throttle_position)
-                # print("Sending ", end='')
-                # ser.write(bytes(STEERING_WHEEL_ANGLE_CMD + "\n", 'UTF-8'))
-                # print(bytes(STEERING_WHEEL_ANGLE_CMD + "\n", 'UTF-8'))
-                # print(bytes(THROTTLE_PEDAL_POS_CMD + "\n", 'UTF-8'))
-                # ser.write(bytes(THROTTLE_PEDAL_POS_CMD + "\n", 'UTF-8'))
+                self.steering_angle = self.response_to_message(FIELDS["steering_angle"], ser)
+                print("Steering: {}".format(self.steering_angle), end=' | ')
+                self.throttle_position = self.response_to_message(FIELDS["throttle_position"], ser)
+                print("Throttle: {}".format(self.throttle_position), end=' | ')
+                self.break_pressed = self.response_to_message(FIELDS["break_pressed"], ser)
+                print("Break: {}".format(self.break_pressed), end=' | ')
+                self.button_pressed = self.response_to_message(FIELDS["button_pressed"], ser)
+                print("Button: {}".format(self.button_pressed), end=' | ')
+                print("")
 
                 # TODO: apply Kalman filter
 
                 # Set joystick values
-                if steering_angle is not None:
-                    self.joystick.emit(uinput.ABS_WHEEL, steering_angle)
-                if throttle_position is not None:
-                    self.joystick.emit(uinput.ABS_THROTTLE, throttle_position)
-
-                time.sleep(0.05)
+                if self.steering_angle is not None:
+                    self.joystick.emit(uinput.ABS_WHEEL, self.steering_angle)
+                if self.throttle_position is not None:
+                    self.joystick.emit(uinput.ABS_THROTTLE, self.throttle_position)
+                if self.break_pressed is not None:
+                    self.joystick.emit(uinput.BTN_0, 1 if self.break_pressed == 4 else 0)
+                if self.button_pressed is not None:
+                    # TODO: better handle buttons voltages
+                    if self.button_pressed >= 4000:  # No buttons pressed
+                        self.joystick.emit(uinput.BTN_1, 0)
+                        self.joystick.emit(uinput.BTN_2, 0)
+                    elif self.button_pressed >= 3200:  # Cruise control "+" pressed
+                        self.joystick.emit(uinput.BTN_1, 1)
+                        self.joystick.emit(uinput.BTN_2, 0)
+                    elif self.button_pressed >= 2500:  # Cruise control "-" pressed
+                        self.joystick.emit(uinput.BTN_1, 0)
+                        self.joystick.emit(uinput.BTN_2, 1)
             except KeyboardInterrupt:
                 break
             except serial.SerialException as e:
@@ -281,7 +314,5 @@ class DataThread():
 
 
 if __name__ == "__main__":
-    data_thread = DataThread("dataThread")
-    data_thread.run()
-    # data_thread.start()
-    # data_thread.join()
+    cansee_joystick = CanSeeJoystick()
+    cansee_joystick.run()
